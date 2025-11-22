@@ -77,6 +77,11 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
         self.cat_value_probs_: Dict[str, np.ndarray] = {}
         self.cat_unique_values_: Dict[str, np.ndarray] = {}
         self.fitted_ = False
+        
+        # Artifacts for Time Category imputation (fitted during fit())
+        self.time_category_mode_: Optional[str] = None
+        self.time_category_labels_: List[str] = ['Night', 'Morning', 'Afternoon', 'Evening', 'Late Night']
+
 
     # ------------------------- helpers -------------------------
     @staticmethod
@@ -112,28 +117,30 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
         if 'Order_Date' in df.columns:
             df['Order_Date'] = pd.to_datetime(df['Order_Date'], errors='coerce', dayfirst=True)
 
-        # Time_Orderd: many odd strings - parse permissively
+        # Time_Orderd: Convert to string representation of time for later combination
         if 'Time_Orderd' in df.columns:
-            # unify textual NaNs first
-            df['Time_Orderd'] = df['Time_Orderd'].astype(str).str.strip().replace({'nan': np.nan, 'None': np.nan})
-            # handle values like "12:34:00" or "12:34" or "12:34:0"
-            def _to_time(x):
+            # First, clean textual NaNs (done in basic_clean, but ensure safe handling)
+            temp_time = df['Time_Orderd'].astype(str).str.strip()
+            
+            # Custom parsing function to handle HH:MM:SS or HH:MM formats
+            def _to_time_str(x):
+                if pd.isna(x) or str(x).lower() in ['nan', 'none']:
+                    return np.nan
                 try:
-                    if pd.isna(x):
-                        return np.nan
-                    # accept HH:MM or HH:MM:SS
                     parts = str(x).split(':')
                     if len(parts) == 2:
+                        # HH:MM format
                         hh, mm = int(parts[0]), int(parts[1])
-                        return pd.to_datetime(f"{hh:02d}:{mm:02d}:00").time()
+                        return f"{hh:02d}:{mm:02d}:00"
                     if len(parts) >= 3:
+                        # HH:MM:SS format
                         hh, mm, ss = int(parts[0]), int(parts[1]), int(parts[2])
-                        return pd.to_datetime(f"{hh:02d}:{mm:02d}:{ss:02d}").time()
+                        return f"{hh:02d}:{mm:02d}:{ss:02d}"
                 except Exception:
                     return np.nan
                 return np.nan
 
-            df['Time_Orderd'] = df['Time_Orderd'].apply(_to_time)
+            df['Time_Orderd'] = temp_time.apply(_to_time_str)
 
         return df
 
@@ -245,8 +252,36 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
                 self.cat_value_probs_[c] = probs
                 logger.info(f"Learned categorical distribution for {c}: {len(uniques)} values")
 
+        # FIT: Time Category Mode (needed for imputation in transform)
+        if 'Order_Date' in df.columns and 'Time_Orderd' in df.columns:
+            temp_df = self._derive_time_features(df.copy())
+            if 'Order_Time_Category' in temp_df.columns:
+                try:
+                    self.time_category_mode_ = temp_df['Order_Time_Category'].mode(dropna=True)[0]
+                except Exception:
+                    self.time_category_mode_ = self.time_category_labels_[1] # Morning as safe fallback
+
         self.fitted_ = True
         return self
+    
+    def _derive_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Helper to create time features (used in both fit and transform)"""
+        if 'Order_Date' in df.columns and 'Time_Orderd' in df.columns:
+            # Combine Date (datetime64[ns]) and Time (string H:M:S) to create Order_Placed
+            df['Order_Placed'] = pd.to_datetime(
+                df['Order_Date'].dt.strftime('%Y-%m-%d') + ' ' + df['Time_Orderd'], errors='coerce'
+            )
+            
+            # Extract hour
+            df['Order_Hour'] = df['Order_Placed'].dt.hour
+
+            # Categorize into bins
+            bins = [0, 6, 12, 17, 21, 24]
+            labels = self.time_category_labels_
+            df['Order_Time_Category'] = pd.cut(df['Order_Hour'], bins=bins, labels=labels, right=False, ordered=False)
+
+        return df
+
 
     def _sample_from_training_dist(self, col: str, n: int) -> np.ndarray:
         """Sample values for a categorical column according to training distribution.
@@ -300,31 +335,23 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
                 med = df['multiple_deliveries'].median()
                 df['multiple_deliveries'] = df['multiple_deliveries'].fillna(med)
 
-        # Derive Order_Time_Category using Order_Date and Time_Orderd safely
+        # --- Feature Extraction and Imputation for Time ---
         if 'Order_Date' in df.columns and 'Time_Orderd' in df.columns:
-            # Compose Order_Placed
-            df['Order_Placed'] = pd.to_datetime(
-                df['Order_Date'].astype(str) + ' ' + df['Time_Orderd'].astype(str), errors='coerce'
-            )
-            # extract hour/minute
-            df['Order_Hour'] = df['Order_Placed'].dt.hour
-            df['Order_Minute'] = df['Order_Placed'].dt.minute
-
-            # categorize into bins -- keep consistent edges used earlier
-            bins = [0, 6, 12, 17, 21, 24]
-            labels = ['Night', 'Morning', 'Afternoon', 'Evening', 'Late Night']
-            df['Order_Time_Category'] = pd.cut(df['Order_Hour'], bins=bins, labels=labels, right=False)
-
-            # If any remain NA, fill by sampling the most common label observed during fit (mode)
-            if df['Order_Time_Category'].isna().any():
-                try:
-                    mode_label = df['Order_Time_Category'].mode(dropna=True)[0]
-                except Exception:
-                    mode_label = labels[1]  # Morning as safe fallback
-                df['Order_Time_Category'] = df['Order_Time_Category'].cat.add_categories([mode_label]).fillna(mode_label)
-
-            # drop helper columns to keep output tidy
-            df.drop(columns=['Order_Placed', 'Order_Hour', 'Order_Minute'], inplace=True, errors='ignore')
+            
+            # 1. Derive features: Order_Placed, Order_Hour, Order_Time_Category
+            df = self._derive_time_features(df)
+            
+            # 2. Impute Order_Time_Category using the mode learned during fit()
+            if 'Order_Time_Category' in df.columns and df['Order_Time_Category'].isna().any():
+                mode_label = self.time_category_mode_
+                if mode_label:
+                    df['Order_Time_Category'] = df['Order_Time_Category'].fillna(mode_label)
+                
+            # 3. Drop irrelevant temporary and source features
+            df.drop(columns=['Order_Placed', 'Order_Hour', 'Time_Orderd'], inplace=True, errors='ignore')
+            
+            # Optional: Impute Order_Date if needed (using mode/ffill, but usually not ideal for time series data)
+            # Keeping Order_Date as is for now, as it's typically used for splitting/time series analysis.
 
         # Final tidy: ensure types
         # Convert Time_taken to integer if present
@@ -351,7 +378,8 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
             'cat_unique_values': self.cat_unique_values_,
             'cat_value_probs': self.cat_value_probs_,
             'seed': self.seed,
-        }, os.path.join(path, 'cat_distributions.joblib'))
+            'time_category_mode': self.time_category_mode_,
+        }, os.path.join(path, 'artifacts.joblib'))
         logger.info(f"Saved artifacts to {path}")
 
     def load_artifacts(self, path: str) -> None:
@@ -359,7 +387,7 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
         num_path = os.path.join(path, 'num_imputer.joblib')
         coord_path = os.path.join(path, 'coord_imputer.joblib')
         mult_path = os.path.join(path, 'mult_deliv_imputer.joblib')
-        cat_path = os.path.join(path, 'cat_distributions.joblib')
+        art_path = os.path.join(path, 'artifacts.joblib')
 
         if os.path.exists(num_path):
             self.num_imputer_ = joblib.load(num_path)
@@ -367,11 +395,12 @@ class DatasetProcessor(BaseEstimator, TransformerMixin):
             self.coord_imputer_ = joblib.load(coord_path)
         if os.path.exists(mult_path):
             self.multiple_deliveries_imputer_ = joblib.load(mult_path)
-        if os.path.exists(cat_path):
-            data = joblib.load(cat_path)
+        if os.path.exists(art_path):
+            data = joblib.load(art_path)
             self.cat_unique_values_ = data.get('cat_unique_values', {})
             self.cat_value_probs_ = data.get('cat_value_probs', {})
             self.seed = data.get('seed', self.seed)
+            self.time_category_mode_ = data.get('time_category_mode', self.time_category_labels_[1])
             self.random_state = check_random_state(self.seed)
 
         self.fitted_ = True
@@ -387,9 +416,31 @@ if __name__ == '__main__':
     parser.add_argument('--outdir', type=str, required=True, help='Directory to save artifacts and a cleaned sample CSV')
     args = parser.parse_args()
 
-    raw = pd.read_csv(args.input)
+    # Create dummy data for testing if a real file isn't available
+    if not os.path.exists(args.input):
+        logger.warning(f"Input file not found: {args.input}. Creating dummy data.")
+        data = {
+            'Order_Date': ['15-03-2022', '16-03-2022', '17-03-2022', '18-03-2022', '19-03-2022'],
+            'Time_Orderd': ['12:00:00', '19:30', '1:00:0', '15:15:00', 'NaN'],
+            'Delivery_person_Age': [25, np.nan, 30, 45, 22],
+            'multiple_deliveries': [1, 2, np.nan, 1, 0],
+            'City': ['Metropolitian', 'Urban', 'Metropolitian', 'Urban', 'Rural'],
+            'Weatherconditions': ['Sunny', 'Storm', 'Sunny', 'Fog', 'NaN'],
+            'Road_traffic_density': ['High', 'Medium', 'Low', 'High', 'NaN'],
+            'Time_taken(min)': ['30 min', '25 min', '20 min', '35 min', '15 min'],
+            'Restaurant_latitude': [20.0, 30.0, 10.0, 25.0, 15.0],
+            'Restaurant_longitude': [80.0, 90.0, 70.0, 75.0, 85.0],
+            'Delivery_location_latitude': [20.1, 30.1, 10.1, 25.1, 15.1],
+            'Delivery_location_longitude': [80.1, 90.1, 70.1, 75.1, 85.1],
+            'Delivery_person_Ratings': [4.5, 4.0, 5.0, 3.5, 4.2]
+        }
+        raw = pd.DataFrame(data)
+    else:
+        raw = pd.read_csv(args.input)
+        
     proc = DatasetProcessor(seed=42)
     cleaned = proc.fit_transform(raw)
+    
     os.makedirs(args.outdir, exist_ok=True)
     cleaned.to_csv(os.path.join(args.outdir, 'cleaned_sample.csv'), index=False)
     proc.save_artifacts(args.outdir)
